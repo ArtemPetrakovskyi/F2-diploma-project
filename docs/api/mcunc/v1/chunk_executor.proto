@@ -1,0 +1,107 @@
+// Контракт Compute Engine -> Simulation Worker Pool (C4 Container, docs/2_design.md, підрозділ 2.5;
+// ADR-001).
+//
+// ТРАНСПОРТ
+//   concurrent.futures.ProcessPoolExecutor (start method spawn). Компонент
+//   ProcessPoolExecutorAdapter передає в робочий процес байти ExecuteChunkRequest
+//   (SerializeToString) і отримує байти ExecuteChunkResponse через pipe ОС.
+//   Python-об'єкти моделей і замикання через межу процесів не передаються.
+//   Розмір запиту <= 64 МіБ (матриця плану chunk_length * d * 8 Б для SOBOL і OAT); відповідь
+//   chunk_length * |quantities| * 8 Б; одночасно в роботі не більше 2 * workers запитів.
+//
+// ВІДТВОРЮВАНІСТЬ (SRS-FUN-20, SRS-FUN-22, SRS-NFR-REPR-01)
+//   Генератор чанка: numpy.random.Generator(PCG64(SeedSequence(entropy = root_seed,
+//   spawn_key = (chunk_index,)))). Результат залежить лише від (root_seed, chunk_index,
+//   chunk_length, конфігурації) і не залежить від кількості процесів і порядку завершення.
+//
+// ПОМИЛКИ
+//   Робочий процес не повертає google.rpc.Status: виняток у процесі або його аварійне
+//   завершення перетворюються адаптером на FailureReason (WORKER_CRASHED, CHUNK_TIMEOUT)
+//   у MonteCarloCoordinator. Невдала окрема траєкторія не є помилкою чанка: її значення
+//   дорівнюють NaN і враховуються в n_failed (SRS-FUN-27).
+
+syntax = "proto3";
+
+package mcunc.v1;
+
+import "buf/validate/validate.proto";
+import "mcunc/v1/types.proto";
+
+service ChunkExecutorService {
+  // Обчислює chunk_length траєкторій одного чанка.
+  rpc ExecuteChunk(ExecuteChunkRequest) returns (ExecuteChunkResponse);
+}
+
+message ExecuteChunkRequest {
+  // simulation_run.uuid
+  string run_id = 1 [(buf.validate.field).string.uuid = true];
+  // Індекс чанка k.
+  int64 chunk_index = 2 [(buf.validate.field).int64.gte = 0];
+  int64 root_seed = 3 [(buf.validate.field).int64.gte = 0];
+  // Кількість траєкторій m <= K (останній чанк може бути коротшим).
+  int32 chunk_length = 4 [(buf.validate.field).int32 = {
+    gte: 1
+    lte: 1000000
+  }];
+  ModelRef model = 5 [(buf.validate.field).required = true];
+  // SHA-256 модуля плагіна; робочий процес перевіряє його за allow-list (SRS-NFR-SEC-04).
+  string plugin_sha256 = 6 [(buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE, (buf.validate.field).string.pattern = "^[0-9a-f]{64}$"];
+  IntegratorSettings integrator = 7 [(buf.validate.field).required = true];
+  double impact_height_m = 8 [(buf.validate.field).double.finite = true];
+  int32 max_steps = 9 [(buf.validate.field).int32 = {
+    gte: 100
+    lte: 10000000
+  }];
+  // Вихідні величини, які потрібно повернути.
+  repeated Quantity quantities = 10 [(buf.validate.field).repeated = {
+    min_items: 1
+    unique: true
+    items: {
+      enum: {
+        defined_only: true
+        not_in: [0]
+      }
+    }
+  }];
+  oneof sampling {
+    option (buf.validate.oneof).required = true;
+    // Випадкова вибірка (RUN_KIND_MONTE_CARLO).
+    RandomSampling random = 11;
+    // Заданий план (RUN_KIND_SOBOL, RUN_KIND_OAT): матриця m x d значень float64
+    // little-endian у порядку рядків, сформована MonteCarloCoordinator.
+    bytes design_matrix_f64le = 12;
+  }
+  // Ліміт часу чанка, с; перевищення дає FAILURE_REASON_CHUNK_TIMEOUT.
+  double timeout_s = 13 [(buf.validate.field).double = {
+    gt: 0
+    lte: 3600
+  }];
+}
+
+message RandomSampling {
+  // Вхідні величини з розподілами або сталими значеннями.
+  repeated InputQuantity inputs = 1 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 64
+  }];
+  // Нижньотрикутний множник Холецького L кореляційної матриці випадкових величин
+  // (d_r x d_r, float64 little-endian, порядок рядків); порожній, якщо кореляцій немає.
+  // Рядок/стовпець r відповідає r-й випадковій величині в порядку зростання ordinal
+  // (сталі величини пропущено); r[i][j] = 0 для пар, відсутніх у CorrelationEntry.
+  bytes cholesky_lower_f64le = 2;
+}
+
+message ExecuteChunkResponse {
+  int64 chunk_index = 1;
+  int32 n_values = 2;
+  // Кількість невдалих траєкторій (NaN у outputs).
+  int32 n_failed = 3;
+  repeated QuantityValues outputs = 4;
+  double wall_time_s = 5;
+}
+
+message QuantityValues {
+  Quantity quantity = 1;
+  // n_values значень float64 little-endian; NaN для невдалих траєкторій.
+  bytes values_f64le = 2;
+}

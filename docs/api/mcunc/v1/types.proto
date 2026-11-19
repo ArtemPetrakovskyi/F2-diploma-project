@@ -1,0 +1,226 @@
+// Спільні типи контрактів Monte Carlo Uncertainty System, версія API mcunc.v1.
+// Використовуються в compute_engine.proto (Desktop GUI -> Compute Engine)
+// та chunk_executor.proto (Compute Engine -> Simulation Worker Pool).
+//
+// Відображення на схему БД (docs/data/schema.sql): значення enum зберігаються в
+// TEXT-колонках без префікса типу (QUANTITY_RANGE -> 'RANGE'); значення *_UNSPECIFIED
+// у БД не записуються.
+
+syntax = "proto3";
+
+package mcunc.v1;
+
+import "buf/validate/validate.proto";
+
+// Вихідна величина траєкторії (колонка quantity у таблицях результатів).
+enum Quantity {
+  QUANTITY_UNSPECIFIED = 0;
+  // Горизонтальна відстань від точки старту до точки падіння, м.
+  QUANTITY_RANGE = 1;
+  // Час польоту до перетину площини падіння, с.
+  QUANTITY_TIME_OF_FLIGHT = 2;
+  // Максимальна висота траєкторії, м.
+  QUANTITY_MAX_HEIGHT = 3;
+  // Координата x точки падіння, м.
+  QUANTITY_IMPACT_X = 4;
+  // Координата z точки падіння (бічне відхилення), м.
+  QUANTITY_IMPACT_Z = 5;
+}
+
+// Посилання на зареєстровану фізичну модель (таблиця physics_model).
+message ModelRef {
+  // Код моделі: m1_vacuum, m2_drag, m3_isa_wind або ім'я плагіна.
+  string code = 1 [(buf.validate.field).string = {
+    pattern: "^[a-z][a-z0-9_]{1,63}$"
+  }];
+  // Версія моделі (SemVer).
+  string version = 2 [(buf.validate.field).string = {
+    min_len: 5
+    max_len: 32
+  }];
+}
+
+// Метод чисельного інтегрування (experiment.integrator, step_s, rtol, atol).
+message IntegratorSettings {
+  oneof method {
+    option (buf.validate.oneof).required = true;
+    Rk4Settings rk4 = 1;
+    DormandPrinceSettings dopri5 = 2;
+  }
+}
+
+// RK4 зі сталим кроком.
+message Rk4Settings {
+  // Крок інтегрування h, с.
+  double step_s = 1 [(buf.validate.field).double = {
+    gt: 0
+    lte: 1
+  }];
+}
+
+// Dormand-Prince з адаптивним кроком.
+message DormandPrinceSettings {
+  double rtol = 1 [(buf.validate.field).double = {
+    gt: 0
+    lt: 1
+  }];
+  double atol = 2 [(buf.validate.field).double.gt = 0];
+}
+
+// Вхідна величина моделі (таблиці input_quantity, distribution_parameter).
+message InputQuantity {
+  // Індекс i у векторі вхідних величин, 0..d-1.
+  int32 ordinal = 1 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 63
+  }];
+  // Код величини з опису моделі (EngineInfo.models[].inputs[].code).
+  string code = 2 [(buf.validate.field).string.pattern = "^[a-z][a-z0-9_]{0,31}$"];
+  // Одиниця вимірювання (SI).
+  string unit = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 16
+  }];
+  oneof value {
+    option (buf.validate.oneof).required = true;
+    // Стала величина (джерело невизначеності відсутнє).
+    double fixed_value = 4 [(buf.validate.field).double.finite = true];
+    // Випадкова величина із заданим розподілом.
+    Distribution distribution = 5;
+  }
+}
+
+// Розподіл ймовірностей вхідної величини.
+message Distribution {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    NormalDistribution normal = 1;
+    UniformDistribution uniform = 2;
+    TriangularDistribution triangular = 3;
+    TruncatedNormalDistribution truncated_normal = 4;
+    LognormalDistribution lognormal = 5;
+    WeibullDistribution weibull = 6;
+    EmpiricalDistribution empirical = 7;
+  }
+}
+
+// DB: MEAN, STD.
+message NormalDistribution {
+  double mean = 1 [(buf.validate.field).double.finite = true];
+  double std = 2 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+}
+
+// DB: LOWER, UPPER.
+message UniformDistribution {
+  option (buf.validate.message).cel = {
+    id: "uniform.bounds"
+    message: "lower must be less than upper"
+    expression: "this.lower < this.upper"
+  };
+  double lower = 1 [(buf.validate.field).double.finite = true];
+  double upper = 2 [(buf.validate.field).double.finite = true];
+}
+
+// DB: LOWER, MODE, UPPER.
+message TriangularDistribution {
+  option (buf.validate.message).cel = {
+    id: "triangular.order"
+    message: "required lower <= mode <= upper and lower < upper"
+    expression: "this.lower <= this.mode && this.mode <= this.upper && this.lower < this.upper"
+  };
+  double lower = 1 [(buf.validate.field).double.finite = true];
+  double mode = 2 [(buf.validate.field).double.finite = true];
+  double upper = 3 [(buf.validate.field).double.finite = true];
+}
+
+// DB: MEAN, STD, LOWER, UPPER.
+message TruncatedNormalDistribution {
+  option (buf.validate.message).cel = {
+    id: "truncated_normal.bounds"
+    message: "lower must be less than upper"
+    expression: "this.lower < this.upper"
+  };
+  double mean = 1 [(buf.validate.field).double.finite = true];
+  double std = 2 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+  double lower = 3 [(buf.validate.field).double.finite = true];
+  double upper = 4 [(buf.validate.field).double.finite = true];
+}
+
+// DB: LOG_MEAN, LOG_STD (параметри нормального розподілу ln X).
+message LognormalDistribution {
+  double log_mean = 1 [(buf.validate.field).double.finite = true];
+  double log_std = 2 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+}
+
+// DB: SHAPE, SCALE, LOCATION.
+message WeibullDistribution {
+  double shape = 1 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+  double scale = 2 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+  double location = 3 [(buf.validate.field).double.finite = true];
+}
+
+// DB: input_quantity.empirical_values (BLOB), empirical_count.
+message EmpiricalDistribution {
+  // Значення вибірки: масив float64 little-endian, від 2 до 10^6 елементів.
+  bytes values_f64le = 1 [(buf.validate.field).bytes = {
+    min_len: 16
+    max_len: 8000000
+  }, (buf.validate.field).cel = {
+    id: "empirical.alignment"
+    message: "length must be a multiple of 8 bytes (float64)"
+    expression: "size(this) % 8 == 0"
+  }];
+}
+
+// Коефіцієнт кореляції пари випадкових вхідних величин (таблиця correlation_coefficient).
+// Передається лише верхній трикутник (i < j) ненульових коефіцієнтів; діагональ дорівнює 1.
+message CorrelationEntry {
+  option (buf.validate.message).cel = {
+    id: "correlation.upper_triangle"
+    message: "required i < j"
+    expression: "this.i < this.j"
+  };
+  int32 i = 1 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 63
+  }];
+  int32 j = 2 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 63
+  }];
+  double rho = 3 [
+    (buf.validate.field).double = {
+      gt: -1
+      lt: 1
+    },
+    (buf.validate.field).cel = {
+      id: "correlation.nonzero"
+      message: "zero coefficients must be omitted"
+      expression: "this != 0.0"
+    }
+  ];
+}
+
+// Версії середовища виконання запуску (таблиця environment).
+message Environment {
+  string engine_version = 1;
+  string python_version = 2;
+  string numpy_version = 3;
+  string scipy_version = 4;
+  string platform = 5;
+}
