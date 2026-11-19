@@ -6,6 +6,11 @@
 //   proto у форматі ProtoJSON (імена полів lowerCamelCase, int64 як рядок, enum як ім'я,
 //   Timestamp як RFC 3339 UTC). Server-streaming RPC (WatchRun) передається як нотифікації
 //   JSON-RPC з method = "RunEvent" без поля id.
+//   Обмеження кадру (docs/2_design.md, 2.5.6): рядок <= 16 МіБ в обох напрямках, глибина JSON <= 32,
+//   дублікати ключів і токени NaN/Infinity заборонені; невідомі поля ProtoJSON -> INVALID_ARGUMENT.
+//   Більший кадр: -32600 з ErrorInfo.reason MESSAGE_TOO_LARGE. Черга <= 32 непрочитаних запитів,
+//   далі RESOURCE_EXHAUSTED (TOO_MANY_PENDING_REQUESTS). Ідемпотентність request_id забезпечує кеш
+//   сеансу Compute Engine (до 1024 ключів: SHA-256 тіла запиту -> ім'я ресурсу).
 //
 // МОДЕЛЬ ПОМИЛОК
 //   Помилки протоколу: -32700 Parse error, -32600 Invalid Request, -32601 Method not found.
@@ -21,7 +26,10 @@
 //   AccessMode фіксується аргументом запуску процесу (--access-mode) і не змінюється в межах
 //   сеансу. Мінімальний режим для кожного RPC задано опцією (mcunc.v1.required_access_mode);
 //   AccessPolicyGuard зчитує її з дескриптора і повертає PERMISSION_DENIED при невідповідності.
-//   Вхідні повідомлення перевіряє RequestValidator за правилами buf.validate (protovalidate).
+//   Вхідні повідомлення перевіряє RequestValidator за правилами buf.validate (protovalidate);
+//   вихідні поля (name, status, progress, etag, frozen, environment, reproduction_match, *_time),
+//   задані клієнтом, відхиляються як INVALID_ARGUMENT (захист від Mass Assignment).
+//   У режимі serve stdin повинен бути анонімним pipe батьківського процесу; інакше ядро не стартує.
 
 syntax = "proto3";
 
@@ -55,7 +63,7 @@ service ComputeEngineService {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
 
-  // Створює експеримент. Помилки: INVALID_ARGUMENT (порушення правил полів;
+  // Створює експеримент. Помилки: INVALID_ARGUMENT (порушення правил полів; задані вихідні поля;
   // CORRELATION_NOT_POSITIVE_DEFINITE; INPUTS_NOT_CONTIGUOUS), FAILED_PRECONDITION
   // (MODEL_NOT_REGISTERED), ALREADY_EXISTS (повтор request_id з іншим тілом).
   rpc CreateExperiment(CreateExperimentRequest) returns (Experiment) {
@@ -80,9 +88,11 @@ service ComputeEngineService {
 
   // Ставить запуск у чергу й повертає Run зі статусом RUN_STATUS_QUEUED; виконання асинхронне.
   // Перший запуск заморожує конфігурацію експерименту. Помилки: INVALID_ARGUMENT
-  // (SOBOL_BUDGET_EXCEEDS_N_MAX: 2^sobol_log2_n * (d + 2) > n_max), NOT_FOUND,
-  // RESOURCE_EXHAUSTED (RUN_ACTIVE: дозволено один активний запуск; RetryInfo),
-  // FAILED_PRECONDITION (EXPERIMENT_DELETED).
+  // (SOBOL_BUDGET_EXCEEDS_N_MAX: 2^sobol_log2_n * (d + 2) > n_max; WORKERS_EXCEED_LIMIT:
+  // workers > EngineInfo.max_workers; CHUNK_TOO_LARGE: chunk_size * d * 8 > 64 МіБ для SOBOL і OAT),
+  // NOT_FOUND, RESOURCE_EXHAUSTED (RUN_ACTIVE: дозволено один активний запуск; RetryInfo),
+  // FAILED_PRECONDITION (EXPERIMENT_DELETED; STORAGE_INSUFFICIENT: вільне місце в каталозі БД
+  // менше 1.2 * 5 * n_max * 8 Б при store_samples).
   rpc CreateRun(CreateRunRequest) returns (Run) {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
@@ -98,15 +108,19 @@ service ComputeEngineService {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
 
-  // Потік подій прогресу та статусу до термінального статусу (SRS-FUN-25).
-  // Помилки: NOT_FOUND.
+  // Потік подій прогресу та статусу до термінального статусу (SRS-FUN-25). Не частіше 10 подій/с;
+  // черга підписника містить одну (останню) подію, термінальна подія доставляється завжди.
+  // Помилки: NOT_FOUND, RESOURCE_EXHAUSTED (TOO_MANY_SUBSCRIBERS: більше 4 підписників на запуск).
   rpc WatchRun(WatchRunRequest) returns (stream RunEvent) {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
 
   // Новий запуск з тими самими root_seed, chunk_size, n_max та конфігурацією; після завершення
-  // заповнює reproduction_match (SRS-FUN-49). Помилки: NOT_FOUND, PERMISSION_DENIED (режим
-  // GUEST), FAILED_PRECONDITION (SOURCE_RUN_NOT_SUCCEEDED), RESOURCE_EXHAUSTED (RUN_ACTIVE).
+  // заповнює reproduction_match (SRS-FUN-49); при технічному збої reproduction_match лишається
+  // порожнім. Помилки: NOT_FOUND, PERMISSION_DENIED (ACCESS_MODE_INSUFFICIENT: режим GUEST),
+  // FAILED_PRECONDITION (SOURCE_RUN_NOT_SUCCEEDED; MODEL_VERSION_MISMATCH: інша версія моделі або
+  // SHA-256 плагіна; SOURCE_DIGESTS_INCOMPLETE: кількість дайджестів джерела не дорівнює
+  // chunks * 5), RESOURCE_EXHAUSTED (RUN_ACTIVE).
   rpc ReproduceRun(ReproduceRunRequest) returns (Run) {
     option (required_access_mode) = ACCESS_MODE_USER;
   }
@@ -119,13 +133,18 @@ service ComputeEngineService {
 
   // Пучок траєкторій вибраних елементів вибірки (SRS-FUN-54); траєкторії перераховуються
   // детерміновано за root_seed та індексом чанка, не зберігаються в БД.
-  // Помилки: INVALID_ARGUMENT (SAMPLE_INDEX_OUT_OF_RANGE), NOT_FOUND, FAILED_PRECONDITION.
+  // Помилки: INVALID_ARGUMENT (SAMPLE_INDEX_OUT_OF_RANGE), NOT_FOUND, FAILED_PRECONDITION,
+  // RESOURCE_EXHAUSTED (BUNDLE_TOO_LARGE: відповідь перевищує 16 МіБ; зменште кількість індексів
+  // або збільште time_step_s).
   rpc GetTrajectoryBundle(GetTrajectoryBundleRequest) returns (TrajectoryBundle) {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
 
-  // Експорт звіту PDF, HTML або CSV (SRS-FUN-58..60). Помилки: INVALID_ARGUMENT, NOT_FOUND,
-  // FAILED_PRECONDITION (RUN_NOT_SUCCEEDED; OUTPUT_DIR_NOT_WRITABLE), ALREADY_EXISTS.
+  // Експорт звіту PDF, HTML або CSV (SRS-FUN-58..60). Шлях канонізується (realpath), файл
+  // записується атомарно (тимчасовий файл 0600 + os.replace). Помилки: INVALID_ARGUMENT
+  // (PATH_NOT_ALLOWED: каталог не абсолютний, не існує, або шлях виходить за його межі чи є
+  // символьним посиланням), NOT_FOUND, FAILED_PRECONDITION (RUN_NOT_SUCCEEDED;
+  // OUTPUT_DIR_NOT_WRITABLE), ALREADY_EXISTS.
   rpc ExportReport(ExportReportRequest) returns (ExportReportResponse) {
     option (required_access_mode) = ACCESS_MODE_GUEST;
   }
@@ -284,6 +303,12 @@ message Run {
     id: "run.sobol_requires_log2_n"
     message: "sobol_log2_n is required only for RUN_KIND_SOBOL"
     expression: "(this.kind == 2) == (this.sobol_log2_n > 0)"
+  };
+  // Пам'ять чанків у роботі: W = 2 * workers чанків по chunk_size * 5 величин * 8 Б <= 256 МіБ.
+  option (buf.validate.message).cel = {
+    id: "run.in_flight_memory"
+    message: "workers * chunk_size must not exceed 3355443 (256 MiB of chunks in flight)"
+    expression: "this.workers * this.chunk_size <= 3355443"
   };
 
   // Вихідне поле. experiments/{experiment}/runs/{run}.

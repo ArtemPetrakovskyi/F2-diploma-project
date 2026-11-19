@@ -6,6 +6,8 @@
 //   ProcessPoolExecutorAdapter передає в робочий процес байти ExecuteChunkRequest
 //   (SerializeToString) і отримує байти ExecuteChunkResponse через pipe ОС.
 //   Python-об'єкти моделей і замикання через межу процесів не передаються.
+//   Розмір запиту <= 64 МіБ (матриця плану chunk_length * d * 8 Б для SOBOL і OAT); відповідь
+//   chunk_length * |quantities| * 8 Б; одночасно в роботі не більше 2 * workers запитів.
 //
 // ВІДТВОРЮВАНІСТЬ (SRS-FUN-20, SRS-FUN-22, SRS-NFR-REPR-01)
 //   Генератор чанка: numpy.random.Generator(PCG64(SeedSequence(entropy = root_seed,
