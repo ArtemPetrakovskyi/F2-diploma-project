@@ -1,0 +1,17 @@
+# Конфігурація buf для контрактів mcunc.v1 (docs/2_design.md, підрозділ 2.5).
+# Перевірка: buf dep update && buf lint && buf build
+version: v2
+modules:
+  - path: .
+deps:
+  - buf.build/bufbuild/protovalidate
+lint:
+  use:
+    - STANDARD
+  except:
+    # Стандартні методи Get/Create/Delete/Cancel повертають ресурс (Google AIP-131, AIP-133).
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

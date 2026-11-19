@@ -1,0 +1,640 @@
+// Контракт Desktop GUI -> Compute Engine (C4 Container, docs/2_design.md, підрозділ 2.5).
+//
+// ТРАНСПОРТ (SRS-IF-03)
+//   JSON-RPC 2.0 через stdio дочірнього процесу Compute Engine (кадрування: один об'єкт
+//   JSON на рядок, UTF-8). method = ім'я RPC ("CreateRun"); params та result = повідомлення
+//   proto у форматі ProtoJSON (імена полів lowerCamelCase, int64 як рядок, enum як ім'я,
+//   Timestamp як RFC 3339 UTC). Server-streaming RPC (WatchRun) передається як нотифікації
+//   JSON-RPC з method = "RunEvent" без поля id.
+//
+// МОДЕЛЬ ПОМИЛОК
+//   Помилки протоколу: -32700 Parse error, -32600 Invalid Request, -32601 Method not found.
+//   Помилки застосунку: error.code = -32602 для INVALID_ARGUMENT, інакше -32000;
+//   error.data = google.rpc.Status у ProtoJSON: code (канонічний код gRPC), message,
+//   details[] (google.rpc.BadRequest з field_violations, google.rpc.ErrorInfo з reason
+//   та domain = "mcunc", google.rpc.RetryInfo для RESOURCE_EXHAUSTED).
+//   Перелік кодів для кожного RPC наведено в коментарі методу.
+//
+// МОДЕЛЬ БЕЗПЕКИ (SRS 1.6, SRS-NFR-SEC-05)
+//   Мережевих портів немає: канал stdio успадковується лише батьківським процесом GUI,
+//   тому автентифікація токенами (JWT, OAuth2) не застосовується. Авторизація: режим доступу
+//   AccessMode фіксується аргументом запуску процесу (--access-mode) і не змінюється в межах
+//   сеансу. Мінімальний режим для кожного RPC задано опцією (mcunc.v1.required_access_mode);
+//   AccessPolicyGuard зчитує її з дескриптора і повертає PERMISSION_DENIED при невідповідності.
+//   Вхідні повідомлення перевіряє RequestValidator за правилами buf.validate (protovalidate).
+
+syntax = "proto3";
+
+package mcunc.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/timestamp.proto";
+import "mcunc/v1/types.proto";
+
+// Режим доступу процесу Compute Engine.
+enum AccessMode {
+  ACCESS_MODE_UNSPECIFIED = 0;
+  // Гість: дані зберігаються лише у тимчасовій БД сеансу (видаляється при завершенні).
+  ACCESS_MODE_GUEST = 1;
+  // Користувач: дані зберігаються в БД профілю.
+  ACCESS_MODE_USER = 2;
+}
+
+extend google.protobuf.MethodOptions {
+  // Мінімальний режим доступу для виклику RPC.
+  AccessMode required_access_mode = 50001;
+}
+
+// Обчислювальне ядро. Ресурси: experiments/{experiment}, experiments/{experiment}/runs/{run};
+// {experiment} та {run} - UUID v4 (experiment.uuid, simulation_run.uuid).
+service ComputeEngineService {
+  // Версія ядра, режим доступу, URI файлу БД (для читання GUI) та реєстр плагінів.
+  // Помилки: UNAVAILABLE.
+  rpc GetEngineInfo(GetEngineInfoRequest) returns (EngineInfo) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Створює експеримент. Помилки: INVALID_ARGUMENT (порушення правил полів;
+  // CORRELATION_NOT_POSITIVE_DEFINITE; INPUTS_NOT_CONTIGUOUS), FAILED_PRECONDITION
+  // (MODEL_NOT_REGISTERED), ALREADY_EXISTS (повтор request_id з іншим тілом).
+  rpc CreateExperiment(CreateExperimentRequest) returns (Experiment) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Помилки: INVALID_ARGUMENT, NOT_FOUND.
+  rpc GetExperiment(GetExperimentRequest) returns (Experiment) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Keyset-пагінація за (create_time DESC, id DESC). Помилки: INVALID_ARGUMENT (page_token).
+  rpc ListExperiments(ListExperimentsRequest) returns (ListExperimentsResponse) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Soft delete (experiment.deleted_at). Помилки: NOT_FOUND, ABORTED (etag не збігається),
+  // FAILED_PRECONDITION (RUN_ACTIVE).
+  rpc DeleteExperiment(DeleteExperimentRequest) returns (Experiment) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Ставить запуск у чергу й повертає Run зі статусом RUN_STATUS_QUEUED; виконання асинхронне.
+  // Перший запуск заморожує конфігурацію експерименту. Помилки: INVALID_ARGUMENT
+  // (SOBOL_BUDGET_EXCEEDS_N_MAX: 2^sobol_log2_n * (d + 2) > n_max), NOT_FOUND,
+  // RESOURCE_EXHAUSTED (RUN_ACTIVE: дозволено один активний запуск; RetryInfo),
+  // FAILED_PRECONDITION (EXPERIMENT_DELETED).
+  rpc CreateRun(CreateRunRequest) returns (Run) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Помилки: INVALID_ARGUMENT, NOT_FOUND.
+  rpc GetRun(GetRunRequest) returns (Run) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Скасування (SRS-FUN-24): завершення робочих процесів <= 2 с; результати не записуються.
+  // Помилки: NOT_FOUND, FAILED_PRECONDITION (RUN_TERMINAL).
+  rpc CancelRun(CancelRunRequest) returns (Run) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Потік подій прогресу та статусу до термінального статусу (SRS-FUN-25).
+  // Помилки: NOT_FOUND.
+  rpc WatchRun(WatchRunRequest) returns (stream RunEvent) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Новий запуск з тими самими root_seed, chunk_size, n_max та конфігурацією; після завершення
+  // заповнює reproduction_match (SRS-FUN-49). Помилки: NOT_FOUND, PERMISSION_DENIED (режим
+  // GUEST), FAILED_PRECONDITION (SOURCE_RUN_NOT_SUCCEEDED), RESOURCE_EXHAUSTED (RUN_ACTIVE).
+  rpc ReproduceRun(ReproduceRunRequest) returns (Run) {
+    option (required_access_mode) = ACCESS_MODE_USER;
+  }
+
+  // Статистика, інтервали, чутливість, валідація проти GUM, збіжність.
+  // Помилки: NOT_FOUND, FAILED_PRECONDITION (RUN_NOT_SUCCEEDED).
+  rpc GetRunResult(GetRunResultRequest) returns (RunResult) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Пучок траєкторій вибраних елементів вибірки (SRS-FUN-54); траєкторії перераховуються
+  // детерміновано за root_seed та індексом чанка, не зберігаються в БД.
+  // Помилки: INVALID_ARGUMENT (SAMPLE_INDEX_OUT_OF_RANGE), NOT_FOUND, FAILED_PRECONDITION.
+  rpc GetTrajectoryBundle(GetTrajectoryBundleRequest) returns (TrajectoryBundle) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+
+  // Експорт звіту PDF, HTML або CSV (SRS-FUN-58..60). Помилки: INVALID_ARGUMENT, NOT_FOUND,
+  // FAILED_PRECONDITION (RUN_NOT_SUCCEEDED; OUTPUT_DIR_NOT_WRITABLE), ALREADY_EXISTS.
+  rpc ExportReport(ExportReportRequest) returns (ExportReportResponse) {
+    option (required_access_mode) = ACCESS_MODE_GUEST;
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// Ядро та реєстр
+// ---------------------------------------------------------------------------------------
+
+message GetEngineInfoRequest {}
+
+message EngineInfo {
+  string engine_version = 1;
+  // Ідентифікатор контракту, "mcunc.v1".
+  string api_version = 2;
+  AccessMode access_mode = 3;
+  // URI файлу SQLite для читання GUI: file:<path>?mode=ro (БД профілю або БД сеансу).
+  string database_uri = 4;
+  // Ім'я профілю; порожнє в режимі ACCESS_MODE_GUEST.
+  string profile_name = 5;
+  repeated ModelDescriptor models = 6;
+  int32 max_workers = 7;
+}
+
+message ModelDescriptor {
+  ModelRef model = 1;
+  bool is_plugin = 2;
+  // Вхідні величини, які приймає модель.
+  repeated InputDescriptor inputs = 3;
+}
+
+message InputDescriptor {
+  string code = 1;
+  string unit = 2;
+  string description = 3;
+}
+
+// ---------------------------------------------------------------------------------------
+// Експеримент (таблиці experiment, input_quantity, distribution_parameter,
+// correlation_coefficient)
+// ---------------------------------------------------------------------------------------
+
+message Experiment {
+  option (buf.validate.message).cel = {
+    id: "experiment.ordinals_contiguous"
+    message: "input ordinals must be unique and form the range 0..d-1"
+    expression: "this.inputs.map(q, q.ordinal).unique() && this.inputs.all(q, q.ordinal < size(this.inputs))"
+  };
+  option (buf.validate.message).cel = {
+    id: "experiment.correlations_reference_random_inputs"
+    message: "correlations must reference inputs with a distribution"
+    expression: "this.correlations.all(c, this.inputs.exists(q, q.ordinal == c.i && has(q.distribution)) && this.inputs.exists(q, q.ordinal == c.j && has(q.distribution)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "experiment.correlation_pairs_unique"
+    message: "each (i, j) pair must appear once"
+    expression: "this.correlations.map(c, c.i * 64 + c.j).unique()"
+  };
+
+  // Вихідне поле. Ім'я ресурсу experiments/{uuid}.
+  string name = 1 [(buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE, (buf.validate.field).string.pattern = "^experiments/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  string title = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 200
+  }];
+  ModelRef model = 3 [(buf.validate.field).required = true];
+  IntegratorSettings integrator = 4 [(buf.validate.field).required = true];
+  // Висота площини падіння, м.
+  double impact_height_m = 5 [(buf.validate.field).double.finite = true];
+  // Ліміт кроків інтегрування однієї траєкторії.
+  int32 max_steps = 6 [(buf.validate.field).int32 = {
+    gte: 100
+    lte: 10000000
+  }];
+  repeated InputQuantity inputs = 7 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 64
+  }];
+  repeated CorrelationEntry correlations = 8 [(buf.validate.field).repeated.max_items = 2016];
+  // Вихідне поле. true після першого запуску (experiment.frozen_at IS NOT NULL).
+  bool frozen = 9;
+  // Вихідні поля.
+  google.protobuf.Timestamp create_time = 10;
+  google.protobuf.Timestamp update_time = 11;
+  google.protobuf.Timestamp delete_time = 12;
+  // Вихідне поле. Версія для оптимістичного блокування: десятковий experiment.row_version.
+  string etag = 13;
+}
+
+message CreateExperimentRequest {
+  Experiment experiment = 1 [(buf.validate.field).required = true];
+  // Ключ ідемпотентності (UUID v4); повтор з тим самим ключем повертає створений ресурс.
+  string request_id = 2 [(buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE, (buf.validate.field).string.uuid = true];
+}
+
+message GetExperimentRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+}
+
+message ListExperimentsRequest {
+  // 0 означає значення за замовчуванням (50).
+  int32 page_size = 1 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 100
+  }];
+  string page_token = 2 [(buf.validate.field).string.max_len = 512];
+  bool show_deleted = 3;
+}
+
+message ListExperimentsResponse {
+  repeated Experiment experiments = 1;
+  string next_page_token = 2;
+}
+
+message DeleteExperimentRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  // Значення Experiment.etag, отримане клієнтом.
+  string etag = 2 [(buf.validate.field).string.pattern = "^[1-9][0-9]{0,18}$"];
+}
+
+// ---------------------------------------------------------------------------------------
+// Запуск (таблиці simulation_run, environment, run_status_event)
+// ---------------------------------------------------------------------------------------
+
+enum RunKind {
+  RUN_KIND_UNSPECIFIED = 0;
+  RUN_KIND_MONTE_CARLO = 1;
+  RUN_KIND_SOBOL = 2;
+  RUN_KIND_OAT = 3;
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_QUEUED = 1;
+  RUN_STATUS_RUNNING = 2;
+  RUN_STATUS_SUCCEEDED = 3;
+  RUN_STATUS_FAILED = 4;
+  RUN_STATUS_CANCELLED = 5;
+}
+
+enum FailureReason {
+  FAILURE_REASON_UNSPECIFIED = 0;
+  // Частка невдалих траєкторій > 1 % (SRS-FUN-28).
+  FAILURE_REASON_FAILURE_RATE_EXCEEDED = 1;
+  // Аварійне завершення робочого процесу (SRS-FUN-29).
+  FAILURE_REASON_WORKER_CRASHED = 2;
+  // Чанк не завершився за ExecuteChunkRequest.timeout_s.
+  FAILURE_REASON_CHUNK_TIMEOUT = 3;
+  // Нечислове значення моделі при обчисленні похідних GUM.
+  FAILURE_REASON_DERIVATIVE_FAILED = 4;
+  FAILURE_REASON_INTERNAL = 5;
+}
+
+message Run {
+  option (buf.validate.message).cel = {
+    id: "run.sobol_requires_log2_n"
+    message: "sobol_log2_n is required only for RUN_KIND_SOBOL"
+    expression: "(this.kind == 2) == (this.sobol_log2_n > 0)"
+  };
+
+  // Вихідне поле. experiments/{experiment}/runs/{run}.
+  string name = 1;
+  RunKind kind = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Кореневий seed, 0..2^63-1 (діапазон SQLite INTEGER). Якщо не задано, ядро генерує
+  // secrets.randbits(63) і повертає використане значення (SRS-FUN-23). Ентропія SeedSequence
+  // за замовчуванням (128 біт) не використовується, бо не вміщується в INTEGER.
+  optional int64 root_seed = 3 [(buf.validate.field).int64.gte = 0];
+  // Розмір чанка K; сталий для запуску і незалежний від workers (SRS-FUN-20).
+  int32 chunk_size = 4 [(buf.validate.field).int32 = {
+    gte: 1
+    lte: 1000000
+  }];
+  // Кількість робочих процесів P.
+  int32 workers = 5 [(buf.validate.field).int32 = {
+    gte: 1
+    lte: 256
+  }];
+  // Верхня межа кількості обчислень моделі N_max (SRS-FUN-19).
+  int32 n_max = 6 [(buf.validate.field).int32 = {
+    gte: 1
+    lte: 10000000
+  }];
+  // Адаптивний вибір N (SRS-FUN-26); відсутнє поле означає N = n_max.
+  AdaptiveStop adaptive = 7;
+  // Лише для RUN_KIND_SOBOL: базовий об'єм n = 2^sobol_log2_n (simulation_run.sobol_base_n).
+  int32 sobol_log2_n = 8 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 20
+  }];
+  AnalysisOptions analysis = 9 [(buf.validate.field).required = true];
+
+  // Вихідні поля.
+  RunStatus status = 10;
+  FailureReason failure_reason = 11;
+  RunProgress progress = 12;
+  // Заповнюється для адаптивного запуску після завершення.
+  optional bool target_reached = 13;
+  // Ім'я запуску-джерела для ReproduceRun.
+  string reproduces_run = 14;
+  // Бітовий збіг вибірок із запуском-джерелом: порівняння SHA-256 кожного чанка кожної
+  // величини (output_sample.sha256 записується завжди, незалежно від store_samples).
+  optional bool reproduction_match = 15;
+  Environment environment = 16;
+  google.protobuf.Timestamp create_time = 17;
+  google.protobuf.Timestamp start_time = 18;
+  google.protobuf.Timestamp end_time = 19;
+}
+
+message AdaptiveStop {
+  // Вихідна величина, за якою оцінюється стандартна похибка середнього.
+  Quantity quantity = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Поріг epsilon стандартної похибки середнього, в одиницях величини.
+  double target_std_error = 2 [(buf.validate.field).double = {
+    gt: 0
+    finite: true
+  }];
+}
+
+message AnalysisOptions {
+  // Рівні квантилів, 0 < p < 1.
+  repeated double quantile_levels = 1 [(buf.validate.field).repeated = {
+    max_items: 32
+    unique: true
+    items: {
+      double: {
+        gt: 0
+        lt: 1
+      }
+    }
+  }];
+  // Ймовірність охоплення для інтервалів (типово 0.95).
+  double coverage_probability = 2 [(buf.validate.field).double = {
+    gt: 0
+    lt: 1
+  }];
+  // Кількість bootstrap-повторів B; 0 вимикає bootstrap.
+  int32 bootstrap_resamples = 3 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 100000
+  }, (buf.validate.field).cel = {
+    id: "analysis.bootstrap_min"
+    message: "bootstrap_resamples must be 0 or at least 100"
+    expression: "this == 0 || this >= 100"
+  }];
+  bool validate_against_gum = 4;
+  // Зберігати вибірки вихідних величин у БД (SRS-FUN-48).
+  bool store_samples = 5;
+  repeated double ellipse_probabilities = 6 [(buf.validate.field).repeated = {
+    max_items: 8
+    unique: true
+    items: {
+      double: {
+        gt: 0
+        lt: 1
+      }
+    }
+  }];
+}
+
+// Прогрес запуску. Для адаптивного N planned_chunks зростає під час запуску;
+// fraction = completed_chunks / planned_chunks.
+message RunProgress {
+  int32 completed_chunks = 1;
+  int32 planned_chunks = 2;
+  // ceil(n_max / chunk_size).
+  int32 max_chunks = 3;
+  int64 n_completed = 4;
+  int64 n_failed = 5;
+  double fraction = 6;
+}
+
+message CreateRunRequest {
+  // experiments/{experiment}
+  string parent = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  Run run = 2 [(buf.validate.field).required = true];
+  // Ключ ідемпотентності (UUID v4).
+  string request_id = 3 [(buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE, (buf.validate.field).string.uuid = true];
+}
+
+message GetRunRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+}
+
+message CancelRunRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+}
+
+message WatchRunRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+}
+
+message RunEvent {
+  string run = 1;
+  RunStatus status = 2;
+  RunProgress progress = 3;
+  google.protobuf.Timestamp event_time = 4;
+}
+
+message ReproduceRunRequest {
+  // Запуск-джерело зі статусом RUN_STATUS_SUCCEEDED.
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  string request_id = 2 [(buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE, (buf.validate.field).string.uuid = true];
+}
+
+// ---------------------------------------------------------------------------------------
+// Результати (таблиці statistic_result, interval_result, normality_test,
+// dispersion_ellipse, sensitivity_index, gum_validation, convergence_point)
+// ---------------------------------------------------------------------------------------
+
+message GetRunResultRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  // Порожній список означає всі величини.
+  repeated Quantity quantities = 2 [(buf.validate.field).repeated = {
+    unique: true
+    items: {
+      enum: {
+        defined_only: true
+        not_in: [0]
+      }
+    }
+  }];
+}
+
+message RunResult {
+  string run = 1;
+  repeated QuantityStatistics statistics = 2;
+  repeated Interval intervals = 3;
+  repeated NormalityTest normality_tests = 4;
+  repeated DispersionEllipse ellipses = 5;
+  repeated SensitivityIndex sensitivity = 6;
+  repeated GumValidation gum_validations = 7;
+  repeated ConvergencePoint convergence = 8;
+}
+
+message QuantityStatistics {
+  Quantity quantity = 1;
+  // Обсяг вибірки без невдалих траєкторій.
+  int64 sample_size = 2;
+  double mean = 3;
+  double median = 4;
+  double variance = 5;
+  double std = 6;
+  double skewness = 7;
+  double kurtosis = 8;
+  double std_error_mean = 9;
+  repeated QuantileValue quantiles = 10;
+}
+
+message QuantileValue {
+  double level = 1;
+  double value = 2;
+}
+
+enum IntervalKind {
+  INTERVAL_KIND_UNSPECIFIED = 0;
+  // Найкоротший інтервал охоплення (JCGM 101).
+  INTERVAL_KIND_COVERAGE_SHORTEST = 1;
+  // Довірчий інтервал середнього за розподілом Стьюдента.
+  INTERVAL_KIND_CI_MEAN_STUDENT = 2;
+  // Bootstrap percentile.
+  INTERVAL_KIND_CI_BOOTSTRAP_PERCENTILE = 3;
+}
+
+message Interval {
+  Quantity quantity = 1;
+  IntervalKind kind = 2;
+  double probability = 3;
+  double lower = 4;
+  double upper = 5;
+  // Лише для INTERVAL_KIND_CI_BOOTSTRAP_PERCENTILE.
+  int32 bootstrap_resamples = 6;
+}
+
+enum NormalityTestKind {
+  NORMALITY_TEST_KIND_UNSPECIFIED = 0;
+  NORMALITY_TEST_KIND_DAGOSTINO_PEARSON = 1;
+  // Підвибірка розміром <= 5000.
+  NORMALITY_TEST_KIND_SHAPIRO_WILK = 2;
+}
+
+message NormalityTest {
+  Quantity quantity = 1;
+  NormalityTestKind test = 2;
+  double statistic = 3;
+  double p_value = 4;
+  int64 sample_size = 5;
+}
+
+message DispersionEllipse {
+  double probability = 1;
+  double center_x = 2;
+  double center_z = 3;
+  double semi_major = 4;
+  double semi_minor = 5;
+  // Кут великої півосі до осі x, рад, (-pi/2, pi/2].
+  double angle_rad = 6;
+}
+
+enum SensitivityMethod {
+  SENSITIVITY_METHOD_UNSPECIFIED = 0;
+  SENSITIVITY_METHOD_SOBOL_FIRST = 1;
+  SENSITIVITY_METHOD_SOBOL_TOTAL = 2;
+  SENSITIVITY_METHOD_SRC = 3;
+  SENSITIVITY_METHOD_OAT = 4;
+  // Коефіцієнт чутливості c_i закону поширення невизначеностей.
+  SENSITIVITY_METHOD_GUM_COEFFICIENT = 5;
+}
+
+message SensitivityIndex {
+  int32 input_ordinal = 1;
+  string input_code = 2;
+  Quantity quantity = 3;
+  SensitivityMethod method = 4;
+  double value = 5;
+  optional double ci_lower = 6;
+  optional double ci_upper = 7;
+}
+
+message GumValidation {
+  Quantity quantity = 1;
+  // f(x̂): значення моделі в точці оцінок вхідних величин.
+  double y_at_estimate = 2;
+  double u_gum = 3;
+  double u_mc = 4;
+  // delta = |u_mc - u_gum| / u_mc; відсутнє, якщо u_mc = 0.
+  optional double rel_deviation = 5;
+  // |mean_mc - f(x̂)| / u_mc; відсутнє, якщо u_mc = 0.
+  optional double mean_shift = 6;
+  // Аналітичний еталон (лише M1).
+  optional double reference_mean = 7;
+  optional double reference_std = 8;
+  int32 model_evaluations = 9;
+}
+
+message ConvergencePoint {
+  Quantity quantity = 1;
+  int64 n = 2;
+  double mean = 3;
+  double std = 4;
+  double std_error_mean = 5;
+}
+
+// ---------------------------------------------------------------------------------------
+// Траєкторії та звіти
+// ---------------------------------------------------------------------------------------
+
+message GetTrajectoryBundleRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  // Глобальні індекси елементів вибірки; індекс j належить чанку floor(j / chunk_size).
+  repeated int64 sample_indices = 2 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 200
+    unique: true
+    items: {
+      int64: {gte: 0}
+    }
+  }];
+  // Крок дискретизації точок траєкторії, с.
+  double time_step_s = 3 [(buf.validate.field).double = {
+    gt: 0
+    lte: 1
+  }];
+}
+
+message TrajectoryBundle {
+  string run = 1;
+  repeated Trajectory trajectories = 2;
+}
+
+message Trajectory {
+  int64 sample_index = 1;
+  // Точки (t, x, y, z): 4 значення float64 little-endian на точку.
+  bytes points_f64le = 2;
+  int32 point_count = 3;
+  // Траєкторія не досягла площини падіння або дала нечислове значення.
+  bool failed = 4;
+}
+
+enum ReportFormat {
+  REPORT_FORMAT_UNSPECIFIED = 0;
+  REPORT_FORMAT_PDF = 1;
+  REPORT_FORMAT_HTML = 2;
+  REPORT_FORMAT_CSV = 3;
+}
+
+message ExportReportRequest {
+  string name = 1 [(buf.validate.field).string.pattern = "^experiments/[0-9a-f-]{36}/runs/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"];
+  ReportFormat format = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Абсолютний шлях каталогу, обраного користувачем у діалозі GUI.
+  string output_dir = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 4096
+  }];
+  // Ім'я файлу без роздільників шляху (report_export.file_name).
+  string file_name = 4 [(buf.validate.field).string.pattern = "^[^/\\\\:*?\"<>|]{1,255}$"];
+  bool overwrite = 5;
+}
+
+message ExportReportResponse {
+  string path = 1;
+  string sha256 = 2;
+  int64 size_bytes = 3;
+}
